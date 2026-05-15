@@ -55,17 +55,16 @@ output/
 
 - `--output-dir <path>`: base output directory (default: `output`)
 - `--timeout <seconds>`: HTTP timeout (default: `30`)
-- `--max-pages <n>`: maximum pages to fetch (default: `20`)
+- `--max-pages <n>`: maximum pages to fetch (default: `30`)
 - `--retries <n>`: download retry count (default: `2`)
 - `--dry-run`: print media URLs and target files without downloading
-- `--verbose`: print extra diagnostic output
-- `--login-mutation-name <name>`: force a specific login mutation
-- `--postcards-query-name <name>`: force a specific postcards query field
 
-Example with custom output and diagnostics:
+Verbose diagnostic output is always enabled and no longer requires a CLI flag.
+
+Example with custom output:
 
 ```bash
-python main.py --date 2026-05-10 --output-dir downloads --verbose
+python main.py --date 2026-05-10 --output-dir downloads
 ```
 
 ## Notes

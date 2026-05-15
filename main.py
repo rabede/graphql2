@@ -4,18 +4,32 @@ import argparse
 import json
 import mimetypes
 import os
+import re
 import sys
 import time
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlparse
 from urllib.request import Request, urlopen
 
 DEFAULT_ENDPOINT = "https://graphql.app-api.prod.aws.mybirdbuddy.com/graphql"
 POSTCARD_TYPENAMES = {"FeedItemNewPostcard", "FeedItemCollectedPostcard"}
+
+
+def get_output_timezone() -> ZoneInfo:
+    try:
+        return ZoneInfo("Europe/Berlin")
+    except ZoneInfoNotFoundError as exc:
+        raise RuntimeError(
+            "Timezone Europe/Berlin is unavailable. Install tzdata (e.g. uv add tzdata) and retry."
+        ) from exc
+
+
+OUTPUT_TIMEZONE = get_output_timezone()
 
 LOGIN_MUTATION = """
 mutation Login($input: EmailSignInInput!) {
@@ -81,24 +95,36 @@ query FeedAfter($first: Int!, $after: String!) {
 
 POSTCARD_MEDIA_QUERY = """
 query PostcardMedia($feedItemId: ID!) {
-  postcardMediasDetails(feedItemId: $feedItemId) {
-    __typename
-    id
-    ... on PostcardImageMediaDetails {
-      media {
+    postcardMediasDetails(feedItemId: $feedItemId) {
+        __typename
         id
-        thumbnailUrl
-        createdAt
-      }
+        ... on PostcardImageMediaDetails {
+            media {
+                id
+                thumbnailUrl
+                createdAt
+            }
+        }
+        ... on PostcardVideoMediaDetails {
+            species {
+                name
+            }
+            suggestions {
+                species {
+                    name
+                }
+                confidence
+            }
+            media {
+                id
+                thumbnailUrl
+                createdAt
+                ... on MediaVideo {
+                    contentUrl(size: ORIGINAL)
+                }
+            }
+        }
     }
-    ... on PostcardVideoMediaDetails {
-      media {
-        id
-        thumbnailUrl
-        createdAt
-      }
-    }
-  }
 }
 """.strip()
 
@@ -119,6 +145,8 @@ class MediaItem:
     media_id: str
     media_type: str
     url: str
+    bird_name: str
+    created_at: datetime
 
 
 def parse_args() -> argparse.Namespace:
@@ -135,7 +163,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-pages", type=int, default=30, help="Maximum feed pages to scan")
     parser.add_argument("--retries", type=int, default=2, help="Retries per media download")
     parser.add_argument("--dry-run", action="store_true", help="Do not download files")
-    parser.add_argument("--verbose", action="store_true", help="Print verbose logs")
     args = parser.parse_args()
 
     try:
@@ -249,7 +276,6 @@ def fetch_postcards_for_date(
     page_size: int,
     max_pages: int,
     timeout: float,
-    verbose: bool,
 ) -> list[Postcard]:
     start, end = day_bounds_utc(date_str)
     cursor: str | None = None
@@ -275,8 +301,7 @@ def fetch_postcards_for_date(
 
         feed = response["data"]["me"]["feed"]
         edges = feed.get("edges", [])
-        if verbose:
-            print(f"Fetched feed page {page} with {len(edges)} items")
+        print(f"Fetched feed page {page} with {len(edges)} items")
 
         stop_paging = False
         for edge in edges:
@@ -327,17 +352,36 @@ def fetch_postcard_media(
     details = response["data"].get("postcardMediasDetails", [])
     for item in details:
         media = item.get("media") or {}
-        url = media.get("thumbnailUrl")
-        media_id = media.get("id") or item.get("id")
         typename = item.get("__typename", "PostcardImageMediaDetails")
         media_type = "video" if "Video" in typename else "image"
+        # Use contentUrl for videos, thumbnailUrl for images
+        url = media.get("contentUrl") if media_type == "video" else media.get("thumbnailUrl")
+        media_id = media.get("id") or item.get("id")
+        created_at_raw = media.get("createdAt")
+        species_list = item.get("species") or []
+        suggestions = item.get("suggestions") or []
+        bird_name = "unknown_bird"
+        if species_list:
+            first_species = species_list[0] or {}
+            species_name = str(first_species.get("name") or "").strip()
+            if species_name:
+                bird_name = species_name
+        elif suggestions:
+            first_suggestion = suggestions[0] or {}
+            suggestion_species = first_suggestion.get("species") or {}
+            suggestion_name = str(suggestion_species.get("name") or "").strip()
+            if suggestion_name:
+                bird_name = suggestion_name
         if url and media_id:
+            created_at = parse_iso(str(created_at_raw)) if created_at_raw else datetime.now(UTC)
             out.append(
                 MediaItem(
                     postcard_id=postcard_id,
                     media_id=str(media_id),
                     media_type=media_type,
                     url=str(url),
+                    bird_name=bird_name,
+                    created_at=created_at,
                 )
             )
 
@@ -356,6 +400,21 @@ def extension_from_url(url: str) -> str:
     return guessed or ".bin"
 
 
+def media_extension(media_type: str, url: str) -> str:
+    if media_type == "video":
+        return ".mp4"
+    ext = extension_from_url(url).lower()
+    if ext in {".jpg", ".jpeg", ".png", ".webp"}:
+        return ext
+    return ".jpg"
+
+
+def slugify_bird_name(name: str) -> str:
+    compact = re.sub(r"\s+", "_", name.strip().lower())
+    cleaned = re.sub(r"[^a-z0-9_]", "", compact)
+    return cleaned or "unknown_bird"
+
+
 def download_media(url: str, destination: Path, timeout: float, retries: int) -> None:
     req = Request(url, method="GET", headers={"Accept": "*/*"})
     attempt = 0
@@ -371,17 +430,30 @@ def download_media(url: str, destination: Path, timeout: float, retries: int) ->
             time.sleep(1.0 * attempt)
 
 
+def unique_destination(base_dir: Path, filename: str) -> Path:
+    destination = base_dir / filename
+    if not destination.exists():
+        return destination
+
+    stem = Path(filename).stem
+    suffix = Path(filename).suffix
+    index = 1
+    while True:
+        candidate = base_dir / f"{stem}_{index:02d}{suffix}"
+        if not candidate.exists():
+            return candidate
+        index += 1
+
+
 def run() -> int:
     try:
         args = parse_args()
         email, password = require_credentials()
 
-        if args.verbose:
-            print("Logging in...")
+        print("Logging in...")
         token = login(args.endpoint, email, password, args.timeout)
 
-        if args.verbose:
-            print("Fetching postcards for date...")
+        print("Fetching postcards for date...")
         postcards = fetch_postcards_for_date(
             endpoint=args.endpoint,
             token=token,
@@ -389,10 +461,10 @@ def run() -> int:
             page_size=args.page_size,
             max_pages=args.max_pages,
             timeout=args.timeout,
-            verbose=args.verbose,
         )
 
-        base_dir = Path(args.output_dir) / args.date
+        base_dir = Path(args.output_dir)
+        base_dir.mkdir(parents=True, exist_ok=True)
         media_total = 0
         downloaded = 0
         failed = 0
@@ -408,21 +480,20 @@ def run() -> int:
                 )
             except ApiError as exc:
                 skipped_postcards += 1
-                if args.verbose:
-                    print(f"Skipping postcard {postcard.postcard_id}: {exc}", file=sys.stderr)
+                print(f"Skipping postcard {postcard.postcard_id}: {exc}", file=sys.stderr)
                 continue
 
             if not media_items:
                 continue
 
             media_total += len(media_items)
-            target_dir = base_dir / f"postcard_{postcard.postcard_id}"
-            target_dir.mkdir(parents=True, exist_ok=True)
 
-            for idx, media in enumerate(media_items, start=1):
-                ext = extension_from_url(media.url)
-                filename = f"media_{idx:02d}_{media.media_type}_{media.media_id}{ext}"
-                destination = target_dir / filename
+            for media in media_items:
+                timestamp = media.created_at.astimezone(OUTPUT_TIMEZONE).strftime("%Y%m%d_%H%M%S")
+                bird_slug = slugify_bird_name(media.bird_name)
+                ext = media_extension(media.media_type, media.url)
+                filename = f"{timestamp}_{bird_slug}{ext}"
+                destination = unique_destination(base_dir, filename)
 
                 if args.dry_run:
                     print(f"[DRY-RUN] {media.url} -> {destination}")
@@ -432,8 +503,7 @@ def run() -> int:
                 try:
                     download_media(media.url, destination, args.timeout, args.retries)
                     downloaded += 1
-                    if args.verbose:
-                        print(f"Downloaded {destination}")
+                    print(f"Downloaded {destination}")
                 except ApiError as exc:
                     failed += 1
                     print(str(exc), file=sys.stderr)

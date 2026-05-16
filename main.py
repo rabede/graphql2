@@ -156,7 +156,7 @@ def parse_args() -> argparse.Namespace:
         default=datetime.now(UTC).strftime("%Y-%m-%d"),
         help="Date in YYYY-MM-DD (default: today in UTC)",
     )
-    parser.add_argument("--output-dir", default="output", help="Base output directory")
+    parser.add_argument("--output-dir", default="../fotos", help="Base output directory")
     parser.add_argument("--endpoint", default=DEFAULT_ENDPOINT, help="BirdBuddy GraphQL endpoint")
     parser.add_argument("--timeout", type=float, default=30.0, help="HTTP timeout seconds")
     parser.add_argument("--page-size", type=int, default=20, help="Feed page size")
@@ -360,7 +360,7 @@ def fetch_postcard_media(
         created_at_raw = media.get("createdAt")
         species_list = item.get("species") or []
         suggestions = item.get("suggestions") or []
-        bird_name = "unknown_bird"
+        bird_name = "unknown"
         if species_list:
             first_species = species_list[0] or {}
             species_name = str(first_species.get("name") or "").strip()
@@ -412,7 +412,7 @@ def media_extension(media_type: str, url: str) -> str:
 def slugify_bird_name(name: str) -> str:
     compact = re.sub(r"\s+", "_", name.strip().lower())
     cleaned = re.sub(r"[^a-z0-9_]", "", compact)
-    return cleaned or "unknown_bird"
+    return cleaned or "unknown"
 
 
 def download_media(url: str, destination: Path, timeout: float, retries: int) -> None:
